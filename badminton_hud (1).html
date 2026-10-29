@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Badminton HUD</title>
+<style>
+body{margin:0;padding:14px;background:#0b1220;color:#e8eefc;font:15px system-ui,sans-serif}
+h1{font-size:18px;margin:0 0 10px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+input[type=text]{background:#14203a;border:1px solid #2b3d66;color:#fff;padding:7px;border-radius:6px;width:110px}
+input[type=number]{background:#14203a;border:1px solid #2b3d66;color:#fff;padding:7px;border-radius:6px;width:60px}
+button{background:#1f6feb;color:#fff;border:0;padding:9px 14px;border-radius:6px;font-size:14px;cursor:pointer}
+button:disabled{opacity:.4;cursor:default}
+#status{color:#7fdcff;margin:6px 0}
+canvas{max-width:100%;border:1px solid #2b3d66;border-radius:6px;background:#000}
+video{position:fixed;left:0;top:0;width:2px;height:2px;opacity:.01;pointer-events:none}
+button,canvas{touch-action:manipulation}
+a#dl{color:#ffd23f;font-weight:600}
+small{color:#8fa0c4}
+</style></head><body>
+<h1>Badminton HUD Generator</h1>
+<div class="row"><input type="file" id="file" accept="video/*"> <span>atau</span> <button id="cam">Pakai kamera (live)</button></div>
+<div class="row">
+ <label>Pemain dekat <input type="text" id="n1" value="NAM"></label>
+ <label>Pemain jauh <input type="text" id="n2" value="PHUMI"></label>
+ <label>Sensitivitas pukulan <input type="number" id="thr" value="7" step="0.5"></label>
+</div>
+<div id="status">1) Pilih video (kamera statis, dari belakang lapangan).</div>
+<div class="row">
+ <button id="reset" disabled>Ulangi klik sudut</button>
+ <button id="start" disabled>Mulai proses &amp; rekam</button>
+ <button id="stop" disabled>Selesai &amp; simpan</button>
+ <a id="dl" style="display:none">Unduh hasil</a>
+ <button id="share" style="display:none">Simpan / Bagikan ke Foto</button>
+</div>
+<canvas id="cv"></canvas>
+<video id="vid" muted playsinline></video>
+<small>Klik 4 sudut garis luar lapangan single: kiri-jauh, kanan-jauh, kanan-dekat, kiri-dekat. Hasil direkam real-time selama video diputar.</small>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js"></script>
+<script>
+const CW=5.18, CL=13.4, CYAN='#3cdcff', ORG='#ff785a';
+const $=id=>document.getElementById(id), cv=$('cv'), ctx=cv.getContext('2d'), vid=$('vid');
+const st=m=>$('status').textContent=m;
+let corners=[], H=null, detector=null, running=false, busy=false, rec=null, chunks=[];
+let players=[],live=false,t0=0,stream=null;
+const nowT=()=>live?(performance.now()-t0)/1000:vid.currentTime;
+
+/* ---------- homography ---------- */
+function solveH(src,dst){
+  const A=[],b=[];
+  for(let i=0;i<4;i++){const[x,y]=src[i],[u,v]=dst[i];
+    A.push([x,y,1,0,0,0,-u*x,-u*y]);b.push(u);
+    A.push([0,0,0,x,y,1,-v*x,-v*y]);b.push(v);}
+  for(let i=0;i<8;i++){
+    let p=i;for(let r=i+1;r<8;r++)if(Math.abs(A[r][i])>Math.abs(A[p][i]))p=r;
+    [A[i],A[p]]=[A[p],A[i]];[b[i],b[p]]=[b[p],b[i]];
+    for(let r=i+1;r<8;r++){const f=A[r][i]/A[i][i];
+      for(let c=i;c<8;c++)A[r][c]-=f*A[i][c];b[r]-=f*b[i];}}
+  const h=Array(8).fill(0);
+  for(let i=7;i>=0;i--){let s=b[i];for(let c=i+1;c<8;c++)s-=A[i][c]*h[c];h[i]=s/A[i][i];}
+  return h;
+}
+const mapPt=(h,x,y)=>{const w=h[6]*x+h[7]*y+1;return[(h[0]*x+h[1]*y+h[2])/w,(h[3]*x+h[4]*y+h[5])/w];};
+
+/* ---------- players ---------- */
+function newPlayer(name,color){return{name,color,pos:null,dist:0,speed:0,top:0,shots:0,lastShot:-9,lastT:null,prevW:null,vis:false,foot:null,topY:0,cx:0};}
+function stamina(p){return Math.max(0,Math.round(100-p.dist*1.3));}
+
+function updatePlayer(p,c,info,kps,t){
+  const dt=p.lastT==null?0:t-p.lastT;
+  p.vis=true;p.foot=info.foot;p.topY=info.top;p.cx=info.cx;
+  if(!p.pos)p.pos=c;
+  else if(dt>0){
+    const n=[0.35*c[0]+0.65*p.pos[0],0.35*c[1]+0.65*p.pos[1]];
+    const step=Math.hypot(n[0]-p.pos[0],n[1]-p.pos[1]);
+    if(step/dt<9){ if(step>0.02)p.dist+=step; p.speed=.5*p.speed+.5*step/dt; p.top=Math.min(40,Math.max(p.top,p.speed*3.6)); }
+    p.pos=n;
+  }
+  const W=['left_wrist','right_wrist'].map(nm=>kps.find(k=>k.name===nm));
+  if(p.prevW&&dt>0){
+    let best=0;
+    for(let i=0;i<2;i++){const a=W[i],b=p.prevW[i];
+      if(a&&b&&a.score>.3&&b.score>.3)best=Math.max(best,Math.hypot(a.x-b.x,a.y-b.y)/info.h/dt);}
+    if(best>parseFloat($('thr').value)&&t-p.lastShot>.6){p.shots++;p.lastShot=t;}
+  }
+  p.prevW=W;p.lastT=t;
+}
+
+/* ---------- detection ---------- */
+function cropBox(){
+  const xs=corners.map(c=>c[0]),ys=corners.map(c=>c[1]);
+  const x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(...ys),y1=Math.max(...ys);
+  const w=x1-x0,h=y1-y0;
+  const bx=Math.max(0,x0-.1*w),by=Math.max(0,y0-.35*h);
+  return{x:bx,y:by,w:Math.min(cv.width,x1+.1*w)-bx,h:Math.min(cv.height,y1+.1*h)-by};
+}
+const crop=document.createElement('canvas'),cctx=crop.getContext('2d');
+async function detect(t){
+  const b=cropBox();crop.width=b.w;crop.height=b.h;
+  cctx.drawImage(vid,b.x,b.y,b.w,b.h,0,0,b.w,b.h);
+  const poses=await detector.estimatePoses(crop);
+  const best=[null,null];
+  for(const po of poses){
+    const k=po.keypoints.map(q=>({name:q.name,x:q.x+b.x,y:q.y+b.y,score:q.score}));
+    const an=k.filter(q=>q.name.endsWith('ankle')&&q.score>.25);
+    const ok=k.filter(q=>q.score>.3);if(!an.length||ok.length<5)continue;
+    const fx=an.reduce((s,q)=>s+q.x,0)/an.length,fy=Math.max(...an.map(q=>q.y));
+    const top=Math.min(...ok.map(q=>q.y)),h=fy-top;
+    const c=mapPt(H,fx,fy);
+    if(c[0]<-1.5||c[0]>CW+1.5||c[1]<-1.5||c[1]>CL+1.5)continue;
+    const s=c[1]>CL/2?0:1;
+    if(!best[s]||h>best[s].info.h)best[s]={c,k,info:{foot:[fx,fy],top,cx:fx,h}};
+  }
+  players.forEach((p,i)=>{p.vis=false;if(best[i])updatePlayer(p,best[i].c,best[i].info,best[i].k,t);});
+}
+
+/* ---------- drawing ---------- */
+function panel(x,y,w,h,a=.72){ctx.globalAlpha=a;ctx.fillStyle='#0c1426';ctx.fillRect(x,y,w,h);ctx.globalAlpha=1;}
+function txt(s,x,y,size,color='#fff',weight='600',align='left'){ctx.font=`${weight} ${size}px system-ui,"Noto Sans Thai",sans-serif`;ctx.fillStyle=color;ctx.textAlign=align;ctx.fillText(s,x,y);}
+function bar(x,y,w,h,v,color){ctx.fillStyle='#2a3a5c';ctx.fillRect(x,y,w,h);ctx.fillStyle=color;ctx.fillRect(x,y,w*v/100,h);}
+
+function drawHUD(t){
+  const W=cv.width,Hh=cv.height,u=W/720;
+  players.forEach(p=>{
+    if(!p.vis)return;
+    ctx.strokeStyle=p.color;ctx.lineWidth=2*u;ctx.beginPath();
+    ctx.ellipse(p.foot[0],p.foot[1],38*u,11*u,0,0,7);ctx.stroke();
+    const bw=120*u,bh=28*u,bx=p.cx-bw/2,by=Math.max(0,p.topY-bh-10*u);
+    panel(bx,by,bw,bh,.85);ctx.strokeStyle=p.color;ctx.lineWidth=1;ctx.strokeRect(bx,by,bw,bh);
+    txt(p.name,bx+6*u,by+17*u,13*u);txt(stamina(p),bx+bw-6*u,by+17*u,13*u,'#fff','600','right');
+    bar(bx+4*u,by+bh-6*u,bw-8*u,3*u,stamina(p),p.color);
+  });
+  const shots=players[0].shots+players[1].shots,top=Math.max(players[0].top,players[1].top);
+  panel(0,0,W,70*u);
+  [['RALLY TIME',`${String(Math.floor(t/60)).padStart(2,'0')}:${(t%60).toFixed(2).padStart(5,'0')}`,'#fff'],
+   ['SHOTS',shots,'#fff'],['PLAYER TOP SPEED km/h',top.toFixed(0),'#ffd23f']]
+  .forEach((c,i)=>{const x=W*(.04+i*.34);txt(c[0],x,22*u,11*u,'#b9c4de','500');txt(c[1],x,56*u,28*u,c[2],'700');});
+  ctx.fillStyle='#e23c3c';ctx.fillRect(10*u,80*u,115*u,24*u);txt('LIVE RALLY',18*u,97*u,13*u);
+  players.forEach((p,i)=>{
+    const y=Hh-(190-i*90)*u,x=10*u,w=W*.5-x;
+    panel(x,y,w,78*u);
+    txt(p.name,x+10*u,y+24*u,17*u,p.color,'700');txt(stamina(p),x+w-10*u,y+24*u,17*u,'#fff','700','right');
+    bar(x+10*u,y+32*u,w-20*u,5*u,stamina(p),p.color);
+    txt(`MOVE ${p.dist.toFixed(1)} m   SHOTS ${p.shots}   TOP ${p.top.toFixed(0)} km/h`,x+10*u,y+64*u,12*u);
+  });
+  const mw=110*u,mh=240*u,x0=W-mw-14*u,y0=Hh-mh-14*u;
+  panel(x0-8*u,y0-26*u,mw+16*u,mh+36*u);txt('COURT MAP',x0,y0-9*u,12*u);
+  const P=(x,y)=>[x0+x/CW*mw,y0+y/CL*mh];
+  ctx.strokeStyle='#aab';ctx.lineWidth=1;ctx.strokeRect(x0,y0,mw,mh);
+  const ln=(a,b)=>{ctx.beginPath();ctx.moveTo(...P(...a));ctx.lineTo(...P(...b));ctx.stroke();};
+  ln([0,CL/2-1.98],[CW,CL/2-1.98]);ln([0,CL/2+1.98],[CW,CL/2+1.98]);
+  ln([CW/2,0],[CW/2,CL/2-1.98]);ln([CW/2,CL/2+1.98],[CW/2,CL]);
+  ctx.strokeStyle='#ffd23f';ln([-.3,CL/2],[CW+.3,CL/2]);
+  players.forEach(p=>{if(!p.pos)return;const q=P(Math.min(CW+.5,Math.max(-.5,p.pos[0])),Math.min(CL+.5,Math.max(-.5,p.pos[1])));
+    ctx.fillStyle=p.color;ctx.beginPath();ctx.arc(q[0],q[1],7*u,0,7);ctx.fill();});
+}
+
+/* ---------- main loop ---------- */
+function drawSetup(){
+  ctx.drawImage(vid,0,0,cv.width,cv.height);
+  corners.forEach((c,i)=>{ctx.fillStyle='#ffd23f';ctx.beginPath();ctx.arc(c[0],c[1],7*cv.width/720,0,7);ctx.fill();
+    txt(i+1,c[0]+10,c[1]-10,16*cv.width/720,'#ffd23f');});
+  if(corners.length>1){ctx.strokeStyle='#ffd23f';ctx.beginPath();corners.forEach((c,i)=>i?ctx.lineTo(...c):ctx.moveTo(...c));
+    if(corners.length==4)ctx.closePath();ctx.stroke();}
+}
+function frame(){
+  if(!running)return;
+  ctx.drawImage(vid,0,0,cv.width,cv.height);
+  drawHUD(nowT());
+  if(!busy){busy=true;detect(nowT()).catch(console.error).finally(()=>busy=false);}
+  if(!live&&vid.ended){finish();return;}
+  requestAnimationFrame(frame);
+}
+function finish(){
+  running=false;$('stop').disabled=true;
+  if(live&&stream){stream.getTracks().forEach(t=>t.stop());}
+  setTimeout(()=>rec&&rec.state!=='inactive'&&rec.stop(),300);
+}
+
+$('file').onchange=e=>{
+  const f=e.target.files[0];if(!f)return;
+  live=false;if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}vid.srcObject=null;
+  vid.src=URL.createObjectURL(f);corners=[];$('dl').style.display='none';
+  vid.onloadeddata=()=>{cv.width=vid.videoWidth;cv.height=vid.videoHeight;vid.currentTime=0;};
+  vid.onseeked=()=>{if(!running){drawSetup();st('2) Klik 4 sudut: kiri-jauh, kanan-jauh, kanan-dekat, kiri-dekat.');$('reset').disabled=false;}};
+};
+cv.onclick=e=>{
+  if(running||corners.length>=4||!vid.videoWidth)return;
+  const r=cv.getBoundingClientRect();
+  corners.push([(e.clientX-r.left)*cv.width/r.width,(e.clientY-r.top)*cv.height/r.height]);
+  drawSetup();
+  if(corners.length==4){H=solveH(corners,[[0,0],[CW,0],[CW,CL],[0,CL]]);$('start').disabled=false;st('3) Tekan "Mulai proses & rekam".');}
+};
+$('cam').onclick=async()=>{
+  try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1280},height:{ideal:720}},audio:false});}
+  catch(err){st('Kamera tidak bisa dibuka: '+err.message);return;}
+  live=true;corners=[];$('dl').style.display='none';vid.removeAttribute('src');vid.onseeked=null;
+  vid.srcObject=stream;await new Promise(r=>vid.onloadedmetadata=r);await vid.play();
+  cv.width=vid.videoWidth;cv.height=vid.videoHeight;$('reset').disabled=false;
+  st('2) Pasang kamera statis, lalu klik 4 sudut lapangan di pratinjau.');liveSetup();
+};
+function liveSetup(){if(!live||running)return;drawSetup();requestAnimationFrame(liveSetup);}
+$('stop').onclick=finish;
+$('share').onclick=()=>navigator.share({files:[window._f]}).catch(()=>{});
+$('reset').onclick=()=>{corners=[];$('start').disabled=true;if(vid.videoWidth)drawSetup();};
+$('start').onclick=async()=>{
+  $('start').disabled=true;$('reset').disabled=true;st('Memuat model AI (butuh internet, sekali saja)...');
+  try{
+    if(!detector){await tf.ready();
+      detector=await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet,
+        {modelType:poseDetection.movenet.modelType.MULTIPOSE_LIGHTNING,enableTracking:false});}
+  }catch(err){st('Gagal memuat model: '+err.message);$('start').disabled=false;return;}
+  players=[newPlayer($('n1').value||'P1',CYAN),newPlayer($('n2').value||'P2',ORG)];
+  const types=['video/mp4;codecs=avc1.42E01E','video/mp4','video/webm;codecs=vp9','video/webm'];
+  const mime=types.find(t=>MediaRecorder.isTypeSupported(t))||'';
+  chunks=[];rec=new MediaRecorder(cv.captureStream(30),mime?{mimeType:mime,videoBitsPerSecond:6e6}:{});
+  rec.ondataavailable=e=>e.data.size&&chunks.push(e.data);
+  rec.onstop=()=>{const type=rec.mimeType||'video/webm';
+    const a=$('dl');const blob=new Blob(chunks,{type});a.href=URL.createObjectURL(blob);
+    a.download='badminton_hud.'+(type.includes('mp4')?'mp4':'webm');a.style.display='inline';window._f=new File([blob],a.download,{type});if(navigator.canShare&&navigator.canShare({files:[window._f]}))$('share').style.display='inline-block';
+    a.textContent='Unduh hasil ('+a.download.split('.').pop()+')';st('Selesai! Klik "Unduh hasil".');$('reset').disabled=false;};
+  if(!live){vid.currentTime=0;await new Promise(r=>{vid.onseeked=r;});vid.onseeked=null;}
+  try{navigator.wakeLock&&navigator.wakeLock.request('screen');}catch(e){}
+  t0=performance.now();rec.start();running=true;$('stop').disabled=!live;
+  st(live?'Merekam LIVE... tekan "Selesai & simpan" untuk berhenti.':'Merekam... jangan tutup/pindah tab sampai video selesai.');
+  if(!live)await vid.play();frame();
+};
+</script></body></html>
